@@ -1,0 +1,12 @@
+#!/bin/sh
+# stove-master: runs /opt/stove-master/stove_master.py with the system config - the same
+# command pi/install.sh installs on the Pi. As root it switches to the "stove" user (except
+# for "setup") so the database files keep the right owner.
+#
+# The Pi's wrapper uses runuser; here it is setpriv, which does not fork: the hub replaces
+# the entrypoint and receives docker's SIGTERM itself, so it shuts down cleanly.
+CONFIG=/etc/stove-master/stove.ini
+if [ "$(id -u)" = 0 ] && [ "${1:-}" != "setup" ]; then
+    exec setpriv --reuid=stove --regid=stove --init-groups -- /usr/bin/python3 /opt/stove-master/stove_master.py --config "$CONFIG" "$@"
+fi
+exec /usr/bin/python3 /opt/stove-master/stove_master.py --config "$CONFIG" "$@"

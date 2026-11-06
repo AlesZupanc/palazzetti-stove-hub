@@ -1,0 +1,5 @@
+# Shell scripts keep LF line endings on every platform: they run on the Pi, on the VPS and
+# inside the Docker image, and sh does not accept CRLF.
+*.sh text eol=lf
+docker/stove-master text eol=lf
+docker/Dockerfile text eol=lf

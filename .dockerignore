@@ -1,0 +1,16 @@
+# only what docker/Dockerfile copies gets sent to the build
+.git
+.github
+docs
+tests
+pi
+www/*
+!www/app
+**/__pycache__
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+*.ini
+README.md
+compose.yaml

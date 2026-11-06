@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Stove">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" content="#12100e">
+<meta name="robots" content="noindex, nofollow">
+<title>Stove</title>
+<script src="theme.js"></script>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+<script src="link.js" defer></script>
+<script src="crypto.js" defer></script>
+<script src="home.js" defer></script>
+<script src="schedule.js" defer></script>
+<script src="pages.js" defer></script>
+<script src="local.js" defer></script>
+<script src="cloud.js" defer></script>
+<script src="push.js" defer></script>
+</head>
+<body>
+<header class="appbar">
+  <div class="appbar-in">
+    <a class="brand" href="#/"><img src="icon.svg" alt=""><span>Stove</span></a>
+    <span class="conn" id="conn" role="status" hidden><i></i><span>Connecting…</span></span>
+    <button class="icon-btn theme-btn" id="themeBtn" type="button" aria-label="Dark mode"></button>
+  </div>
+</header>
+<nav class="tabbar" id="nav" aria-label="Sections" hidden></nav>
+<main id="view">
+  <div class="screen">
+    <div class="card"><div class="skel tall"></div></div>
+  </div>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+<noscript><main><div class="card">This app needs JavaScript.</div></main></noscript>
+</body>
+</html>

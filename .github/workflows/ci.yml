@@ -1,0 +1,50 @@
+# Tests on every push and pull request. When they pass on main, the branch "deploy" is
+# moved to that commit. The VPS and the Pis that were set up with --auto-update
+# (www/deploy.sh, pi/install.sh; tools/auto-update.sh) follow that branch, so only
+# tested code reaches them - about a minute after the tests pass.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:           # Actions -> CI -> Run workflow: e.g. once in a new fork, to create deploy
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"      # Debian bookworm: Raspberry Pi OS and the VPS
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"          # the WebSocket and crypto.js tests also run against Node
+      - run: pip install cryptography
+      - run: python -m unittest discover -s tests -v
+
+  promote:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: promote-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Only forward: when the tests of two pushes finish out of order (or an old run is re-run),
+      # deploy keeps the newer commit. (If main's history is ever rewritten, move deploy by hand.)
+      - name: Move the deploy branch to this tested commit
+        run: |
+          if git rev-parse -q --verify origin/deploy >/dev/null && ! git merge-base --is-ancestor origin/deploy HEAD; then
+            echo "deploy already holds a newer commit ($(git rev-parse --short origin/deploy)) - not moving it back"
+            exit 0
+          fi
+          git push --force origin HEAD:refs/heads/deploy

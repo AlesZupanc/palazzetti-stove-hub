@@ -1,0 +1,61 @@
+# compose.yaml - the stove master and a simulated Connection Box on your PC (Docker Desktop).
+#
+#   docker compose up -d --build                           # dashboard: http://localhost:8080/
+#   docker compose logs -f stove-master                    # like journalctl -u stove-master -f
+#   docker compose exec stove-master stove-master status   # the Pi's command line (token, links, schedule ...)
+#   docker compose down                                    # -v deletes the database too
+#
+# The hub runs as on the Pi (docker/Dockerfile): the Pi's Debian, folders, user and
+# "stove-master" command. Only the configuration comes from the environment below instead
+# of the setup wizard (docker/entrypoint.sh lists every variable). The second container
+# stands in for the Connection Box and the stove (tools/fake_cbox.py); it lights and cools
+# down 10x faster than a real stove. Its internals: http://localhost:8081/_fake/state
+
+name: palazzetti-stove
+
+services:
+  stove-master:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: hub
+    image: stove-master
+    hostname: stove                              # so http://stove:8080/ is an accepted name too
+    # no init: the hub itself is PID 1 (setpriv execs it) and handles SIGTERM like under systemd;
+    # a root tini could not signal the "stove" user's process once CAP_KILL is dropped
+    restart: unless-stopped
+    depends_on:
+      fake-cbox:
+        condition: service_healthy
+    ports:
+      - "${HUB_PORT:-8080}:80"                   # port 80 inside, like the Pi
+    environment:
+      TZ: ${TZ:-UTC}                             # the schedule runs on local time - set yours, e.g. Europe/Vienna
+      STOVE_BOX_HOST: ${STOVE_BOX_HOST:-fake-cbox:8081}   # a real box instead: its IP, e.g. 192.168.1.50
+      STOVE_WEB_PORT: "80"
+      STOVE_ALLOWED_HOSTS: ${STOVE_ALLOWED_HOSTS:-}       # your PC's name, to open it from a phone by name
+      STOVE_MDNS_ENABLED: "no"                   # no multicast out of Docker: run tools/stove_local.py on the PC
+      STOVE_CLOUD_URL: ${STOVE_CLOUD_URL:-}      # e.g. https://example.com/mystove/ to go online
+      STOVE_WAIT_FOR_TIME_SYNC: "no"             # the container has no NTP client; the host keeps the clock
+    volumes:
+      - stove-data:/var/lib/stove-master         # stove.db: schedule, activity, linked accounts, token
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID]             # the entrypoint drops from root to "stove"
+    security_opt:
+      - no-new-privileges:true
+
+  fake-cbox:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: cbox
+    image: fake-cbox
+    init: true
+    restart: unless-stopped
+    command: ["--port", "8081", "--speed", "${CBOX_SPEED:-10}", "--latency", "0.3", "--udp"]
+    ports:
+      - "${CBOX_PORT:-8081}:8081"                # python palazzetti.py --host localhost:8081 status
+    cap_drop: [ALL]
+
+volumes:
+  stove-data:
