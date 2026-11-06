@@ -64,7 +64,9 @@ login over plain `http://` would not protect anything. Instead the hub
 refuses anything that does not come from the home network:
 
 * the client address must be private (10/8, 172.16/12, 192.168/16, 100.64/10,
-  169.254/16, loopback, fc00::/7, fe80::/10) unless `[web] lan_only = no`;
+  169.254/16, loopback, fc00::/7, fe80::/10 - only these: 6to4 and Teredo
+  addresses, which Python also calls private, belong to hosts on the internet)
+  unless `[web] lan_only = no`;
 * the `Host` header must be an IP address, `<name>.local`, the Pi's host name,
   `localhost` or a name listed in `[web] allowed_hosts` (stops DNS rebinding);
 * a WebSocket must come from a page of the hub itself (`Origin` check), so a
@@ -214,11 +216,15 @@ from the VPS.
 `wss://…/mystove/ws/device` (header `Authorization: Device <id>.<secret>`):
 the hub's always-on connection. The first connection registers the device id
 with that secret (trust on first use); later ones must present the same
-secret. Messages carry a session id `sid` chosen by the VPS: `open`, `data`,
-`close` towards the hub; `accept`, `data`, `close`, `link` (add/remove an
-account), `push` from the hub; `welcome` and `links` tell the hub which
-accounts the VPS still routes, so links removed on the website disappear on
-the hub as well.
+secret. A request that is no WebSocket registers nothing and new ids are
+limited per address (per /64 for IPv6). When `[limits] max_devices` is reached,
+hubs no account added that are offline make room (those not seen for two days,
+or else the one seen longest ago), so made-up ids cannot keep real hubs out; a
+forgotten hub registers again when it reconnects. Messages carry a session id
+`sid` chosen by the VPS: `open`, `data`, `close` towards the hub; `accept`,
+`data`, `close`, `link` (add/remove an account), `push` from the hub; `welcome`
+and `links` tell the hub which accounts the VPS still routes, so links removed
+on the website disappear on the hub as well.
 
 Ping every 25 s keeps NAT routers and nginx from closing idle connections.
 

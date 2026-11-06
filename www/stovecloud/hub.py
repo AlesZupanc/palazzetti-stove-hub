@@ -22,14 +22,16 @@ import threading
 import time
 
 from . import ws
-from .accounts import RateLimiter
+from .accounts import RateLimiter, client_key
 
 log = logging.getLogger("hub")
 
 DEVICE_ID_RE = re.compile(r"^[A-Z2-7]{8}$")
 OPEN_LIMIT = (30, 60)            # session opens per browser connection per minute
 PAIR_LIMIT = (10, 600)           # pairing attempts per account per 10 minutes
-REGISTER_LIMIT = (10, 3600)      # new hubs per IP per hour
+REGISTER_LIMIT = (10, 3600)      # new hubs per IP (IPv6: per /64) per hour
+UNLINKED_TTL = 2 * 86400         # a hub no account added is forgotten after this long offline
+SESSION_CHECK = 60               # seconds between checks that a browser's sign-in still exists
 MAX_CLIENTS_PER_USER = 20
 MAX_C = 256 * 1024               # one encrypted message from a browser (hubs accept 1 MB)
 DEVICE_QUEUE = 16 << 20          # bytes waiting for a hub before its connection is dropped
@@ -69,6 +71,7 @@ class ClientConn(Conn):
         self.sid = None
         self.mode = None
         self.opens = RateLimiter()
+        self.checked = time.monotonic()       # the sign-in was checked when the WebSocket opened
 
 
 class Hub:
@@ -114,7 +117,7 @@ class Hub:
                 raise PermissionError(401, "wrong secret for this device id")
         else:
             # trust on first use, within limits
-            if self.limits.acquire([("register:" + ip, *REGISTER_LIMIT)]):
+            if self.limits.acquire([("register:" + client_key(ip), *REGISTER_LIMIT)]):
                 raise PermissionError(429, "too many new devices from this address")
             if self.db.one("SELECT COUNT(*) AS n FROM devices")["n"] >= self.cfg.max_devices:
                 self._prune_devices()
@@ -126,9 +129,24 @@ class Hub:
         return device_id
 
     def _prune_devices(self):
-        """Forget hubs nobody linked that have not been seen for 30 days."""
-        self.db.run("DELETE FROM devices WHERE id NOT IN (SELECT device_id FROM links) AND "
-                    "COALESCE(last_seen, created_at) < ?", (time.time() - 30 * 86400,))
+        """Make room: forget the hubs no account added that are offline and were not seen for
+        UNLINKED_TTL, or else the one of them seen longest ago. A real hub is online while it
+        registers and is added soon after; one forgotten while offline registers again (with the
+        same secret) when it reconnects. So made-up ids cannot keep real hubs out."""
+        with self.lock:
+            online = set(self.devices)
+        idle = [r for r in self.db.all("SELECT id, COALESCE(last_seen, created_at) AS seen FROM devices "
+                                       "WHERE id NOT IN (SELECT device_id FROM links) ORDER BY seen")
+                if r["id"] not in online]
+        doomed = [r["id"] for r in idle if r["seen"] < time.time() - UNLINKED_TTL] or [r["id"] for r in idle[:1]]
+        for device_id in doomed:
+            self.db.run("DELETE FROM devices WHERE id = ? AND id NOT IN (SELECT device_id FROM links)", (device_id,))
+
+    def device_failed(self, device_id):
+        """The request that presented these credentials was no WebSocket: keep no row for a hub
+        that never connected."""
+        self.db.run("DELETE FROM devices WHERE id = ? AND last_seen IS NULL AND "
+                    "id NOT IN (SELECT device_id FROM links)", (device_id,))
 
     def serve_device(self, device_id, sock, ip):
         conn = DeviceConn(device_id, sock, ip)
@@ -301,6 +319,8 @@ class Hub:
             c = msg.get("c")
             if not client.sid or not isinstance(c, str):
                 return
+            if time.monotonic() - client.checked > SESSION_CHECK and not self._signed_in(client):
+                return
             dev = self.devices.get(client.device_id)
             if dev is None:
                 return
@@ -318,6 +338,16 @@ class Hub:
         self._end_client_session(client, reason)
         client.send({"t": "closed", "reason": reason})
 
+    def _signed_in(self, client):
+        """The sign-in may have ended since the WebSocket was opened (signed out elsewhere, password
+        changed, account disabled - also on the command line, which cannot reach these sockets)."""
+        client.checked = time.monotonic()
+        if self.db.one("SELECT 1 AS x FROM sessions WHERE token_hash = ? AND expires_at > ?",
+                       (client.session_hash, time.time())):
+            return True
+        client.sock.close(4401, "signed out")
+        return False
+
     def _open(self, client, msg):
         user = client.user
         mode = msg.get("mode")
@@ -330,10 +360,7 @@ class Hub:
         if client.opens.acquire([("open", *OPEN_LIMIT)]):
             client.send({"t": "closed", "reason": "too many attempts, try again later"})
             return
-        # the sign-in may have ended since the WebSocket was opened
-        if not self.db.one("SELECT 1 AS x FROM sessions WHERE token_hash = ? AND expires_at > ?",
-                           (client.session_hash, time.time())):
-            client.sock.close(4401, "signed out")
+        if not self._signed_in(client):
             return
         if mode == "pair":
             if self.limits.acquire([(f"pair:{user['id']}", *PAIR_LIMIT)]):
@@ -377,10 +404,11 @@ class Hub:
                 dev.send({"t": "links", "links": self.linked_users(device_id)})
         self.drop_user(user_id)
 
-    def drop_user(self, user_id, session_hash=None):
-        """Close the browsers of an account (all, or those of one sign-in)."""
+    def drop_user(self, user_id, session_hash=None, keep_hash=None):
+        """Close the browsers of an account (all, those of one sign-in, or all but those of one)."""
         with self.lock:
             victims = [c for s in self.clients.values() for c in s
-                       if c.user["id"] == user_id and (session_hash is None or c.session_hash == session_hash)]
+                       if c.user["id"] == user_id and (session_hash is None or c.session_hash == session_hash)
+                       and (keep_hash is None or c.session_hash != keep_hash)]
         for c in victims:
             c.sock.close(4401, "signed out")

@@ -9,6 +9,7 @@ key, the salt for the browser's derivation and the encrypted vault.
 import base64
 import hashlib
 import hmac
+import ipaddress
 import re
 import secrets
 import threading
@@ -81,6 +82,20 @@ def verify_auth(auth_b64, stored):
 
 def token_hash(token):
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def client_key(ip):
+    """What the per-IP limits count: the address, but for IPv6 its /64, which one home line or
+    server gets as a whole (it could otherwise use a new address for every try)."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip or "?"
+    if a.version == 6 and a.ipv4_mapped:
+        return str(a.ipv4_mapped)
+    if a.version == 6:
+        return str(ipaddress.ip_network((int(a) >> 64 << 64, 64)))
+    return str(a)
 
 
 def clean_username(username):
@@ -228,7 +243,9 @@ class Accounts:
         else:
             self.db.run("UPDATE users SET status = ? WHERE id = ?", (status, user_id))
             self.revoke_sessions(user_id)
-        if status != "pending":
+        if status == "disabled":   # no unused setup or reset link may bring the account back
+            self.db.run("DELETE FROM tokens WHERE user_id = ?", (user_id,))
+        elif status != "pending":
             self.db.run("DELETE FROM tokens WHERE user_id = ? AND kind = 'approve'", (user_id,))
 
     def set_role(self, user_id, role):
@@ -268,7 +285,7 @@ class Accounts:
         login = login.strip().lower() if isinstance(login, str) else ""
         if not login or not isinstance(auth, str) or not auth:
             raise AuthError("Enter your username (or e-mail) and password.")
-        ip = ip or "?"
+        ip = client_key(ip)
         rules = [("login-pair:" + login + "|" + ip, *LOGIN_PAIR_LIMIT), ("login-ip:" + ip, *LOGIN_IP_LIMIT),
                  ("login-user:" + login, *LOGIN_USER_LIMIT)]
         wait = self.limits.acquire(rules)
@@ -349,7 +366,7 @@ class Accounts:
     def register(self, username, email, salt, auth, iterations, ip):
         if self.db.one("SELECT COUNT(*) AS n FROM users WHERE status = 'pending'")["n"] >= MAX_PENDING:
             raise AuthError("Too many accounts are waiting for approval. Try again later.", 429)
-        rules = [("register-ip:" + (ip or "?"), *REGISTER_IP_LIMIT), ("register-all", *REGISTER_GLOBAL_LIMIT)]
+        rules = [("register-ip:" + client_key(ip), *REGISTER_IP_LIMIT), ("register-all", *REGISTER_GLOBAL_LIMIT)]
         wait = self.limits.acquire(rules)
         if wait:
             raise AuthError(f"Too many registrations. Try again in {wait_text(wait)}.", 429)
@@ -363,7 +380,7 @@ class Accounts:
 
     def request_reset(self, login, ip):
         login = login.strip().lower() if isinstance(login, str) else ""
-        wait = self.limits.acquire([("forgot-ip:" + (ip or "?"), *FORGOT_IP_LIMIT),
+        wait = self.limits.acquire([("forgot-ip:" + client_key(ip), *FORGOT_IP_LIMIT),
                                     ("forgot-user:" + login, *FORGOT_USER_LIMIT)])
         if wait:
             raise AuthError(f"Too many requests. Try again in {wait_text(wait)}.", 429)

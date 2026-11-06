@@ -589,7 +589,9 @@ class LanChecks(unittest.TestCase):
         for ip in ("192.168.1.5", "10.0.0.2", "172.20.1.1", "127.0.0.1", "::1", "fe80::1", "fd00::5",
                    "100.101.102.103", "::ffff:192.168.1.9", "169.254.3.4"):
             self.assertTrue(lan.ip_allowed(ip), ip)
-        for ip in ("8.8.8.8", "2a00:1450::1", "::ffff:8.8.8.8", "nonsense"):
+        for ip in ("8.8.8.8", "2a00:1450::1", "::ffff:8.8.8.8", "nonsense",
+                   # Python calls these private, but 6to4 and Teredo are tunnels to hosts on the internet
+                   "2002:cb00:7107::1", "2001:0:4136:e378:8000:63bf:3fff:fdd2", "2001:db8::1", "100::1"):
             self.assertFalse(lan.ip_allowed(ip), ip)
 
     def test_split_host(self):

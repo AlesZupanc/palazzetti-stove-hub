@@ -28,7 +28,12 @@ from .api import Client
 log = logging.getLogger("lan")
 
 MAX_LAN_SOCKETS = 40
-CGNAT = ipaddress.ip_network("100.64.0.0/10")    # Tailscale and carrier-grade NAT
+# the home network (docs/protocol.md, section 2), listed rather than Python's is_private, which
+# also counts 6to4 (2002::/16) and Teredo (2001::/32): tunnel addresses of hosts on the internet
+LOCAL_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16",
+    "100.64.0.0/10",                              # Tailscale and carrier-grade NAT
+    "::1/128", "fe80::/10", "fc00::/7"))
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
@@ -97,7 +102,7 @@ def ip_allowed(ip):
         return False
     if a.version == 6 and a.ipv4_mapped:
         a = a.ipv4_mapped
-    return a.is_private or a.is_loopback or a.is_link_local or (a.version == 4 and a in CGNAT)
+    return any(a in n for n in LOCAL_NETS)
 
 
 def split_host(host_header):

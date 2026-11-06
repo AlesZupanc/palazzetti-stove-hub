@@ -27,6 +27,7 @@ MAX_PER_ACCOUNT = 12
 PAIR_LIMIT = (5, 600)        # pairing attempts per account per 10 minutes
 PAIR_GLOBAL_LIMIT = (20, 3600)
 PUSH_TTL = 6 * 3600
+SYNC_INTERVAL = 20           # seconds between looks for links removed by the command line
 
 
 def device_ws_url(cloud_url):
@@ -53,11 +54,12 @@ class CloudLink:
         self.ws_url = device_ws_url(cfg.cloud_url)
         self.device_id = self._setting("device_id", e2e.new_device_id)
         self.device_secret = self._setting("device_secret", lambda: secrets.token_urlsafe(32))
-        self._setting("pair_secret", lambda: e2e.b64e(e2e.new_pair_secret()))
+        self._token_seen = self._setting("pair_secret", lambda: e2e.b64e(e2e.new_pair_secret()))
         self.links = {}
         self._load_links()
         self.sessions = {}
         self.lock = threading.RLock()
+        self._links_lock = threading.RLock()   # sync_links never sees a link or token half changed
         self.connected = False
         self.connected_since = None
         self.last_error = ""
@@ -65,6 +67,7 @@ class CloudLink:
         self._sender = None
         self._stop = threading.Event()
         self._thread = None
+        self._sync_thread = None
         self._attempts = []        # pairing attempts: (time, profile id)
         self.methods = {
             "link.leave": (self.link_leave, "remote"),
@@ -95,13 +98,42 @@ class CloudLink:
         return e2e.format_token(self.device_id, self.pair_secret)
 
     def regenerate(self):
-        self.db.set_setting("pair_secret", e2e.b64e(e2e.new_pair_secret()))
-        with self.lock:   # sessions opened with the old token end too
+        with self._links_lock:
+            self.db.set_setting("pair_secret", e2e.b64e(e2e.new_pair_secret()))
+            self._end_pairing()
+        self.changed()
+        return self.info(lan=True)
+
+    def _end_pairing(self):
+        """Sessions opened with the old token end too."""
+        self._token_seen = self.db.get_setting("pair_secret")
+        with self.lock:
             doomed = [s.sid for s in self.sessions.values() if s.mode == "pair"]
         for sid in doomed:
             self._close(sid, reason="the token was replaced")
-        self.changed()
-        return self.info(lan=True)
+
+    def sync_links(self):
+        """Take up what another process changed in the database ("sudo stove-master links remove",
+        "token --new"): end the sessions of removed links and tell the VPS, as unlink() does, and
+        end pairing sessions of a replaced token. Before every new session and every SYNC_INTERVAL."""
+        with self._links_lock:
+            ids = {r["id"] for r in self.db.all("SELECT id FROM links")}
+            for link_id in [i for i in self.links if i not in ids]:
+                self.unlink(link_id, reason="removed on the command line")
+            if ids != set(self.links):
+                self._load_links()
+            token_replaced = self.db.get_setting("pair_secret") != self._token_seen
+            if token_replaced:
+                self._end_pairing()
+        if token_replaced:
+            self.changed()
+
+    def _sync_loop(self):
+        while not self._stop.wait(SYNC_INTERVAL):
+            try:
+                self.sync_links()
+            except Exception:
+                log.exception("checking the links failed")
 
     # -- state for the UI ----------------------------------------------------------
     def status(self):
@@ -129,6 +161,8 @@ class CloudLink:
         if self._thread is None:
             self._thread = threading.Thread(target=self._run, name="cloud", daemon=True)
             self._thread.start()
+            self._sync_thread = threading.Thread(target=self._sync_loop, name="cloud-links", daemon=True)
+            self._sync_thread.start()
 
     def stop(self):
         self._stop.set()
@@ -228,6 +262,7 @@ class CloudLink:
 
     def _reconcile(self, profiles):
         """Accounts the VPS still routes to us; links removed on the website go here too."""
+        self.sync_links()
         online = {str(p) for p in profiles}
         for link in list(self.links.values()):
             if link["profile_id"] not in online:
@@ -253,6 +288,7 @@ class CloudLink:
         pid, pname = str(profile.get("id") or ""), str(profile.get("name") or "?")[:64]
         mode = msg.get("mode")
         link = None
+        self.sync_links()            # never a session for a link or token the command line removed
         with self.lock:
             busy = len(self.sessions) >= MAX_SESSIONS or \
                 sum(1 for s in self.sessions.values() if s.client.profile.get("id") == pid) >= MAX_PER_ACCOUNT
@@ -330,24 +366,26 @@ class CloudLink:
                 raise RPCError("This pairing session is over - start again.", 409)
             rs.finished = True
         pid, name = client.profile["id"], client.profile["name"]
-        old = self.db.one("SELECT id FROM links WHERE profile_id = ?", (pid,))
-        if old:
-            self._delete_link(old["id"])
-        link_id = secrets.token_hex(8)
-        key = os.urandom(32)
-        self.db.run("INSERT INTO links(id, profile_id, profile, key, created_at) VALUES(?, ?, ?, ?, ?)",
-                    (link_id, pid, name, e2e.b64e(key), time.time()))
-        self._load_links()
-        self._send({"t": "link", "op": "add", "profile": pid})   # before the answer: the VPS must route it
+        with self._links_lock:
+            old = self.db.one("SELECT id FROM links WHERE profile_id = ?", (pid,))
+            if old:
+                self._delete_link(old["id"])
+            link_id = secrets.token_hex(8)
+            key = os.urandom(32)
+            self.db.run("INSERT INTO links(id, profile_id, profile, key, created_at) VALUES(?, ?, ?, ?, ?)",
+                        (link_id, pid, name, e2e.b64e(key), time.time()))
+            self._load_links()
+            self._send({"t": "link", "op": "add", "profile": pid})   # before the answer: the VPS must route it
         self.db.log_event(name, "remote", "account added", f"{name} can now reach the stove from the internet")
         self.notify("problems", "Account added", f"{name} added the stove to their online account.", "link")
         self.changed()
         return {"link": link_id, "key": e2e.b64e(key), "device": {"id": self.device_id, "name": self.hub.device_name}}
 
     def _delete_link(self, link_id):
-        link = self.links.get(link_id)
-        self.db.run("DELETE FROM links WHERE id = ?", (link_id,))
-        self._load_links()
+        with self._links_lock:
+            link = self.links.get(link_id)
+            self.db.run("DELETE FROM links WHERE id = ?", (link_id,))
+            self._load_links()
         with self.lock:
             doomed = [s.sid for s in self.sessions.values() if s.client.link and s.client.link["id"] == link_id]
         for sid in doomed:

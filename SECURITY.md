@@ -25,8 +25,10 @@ clone; an uploaded `www/` folder has to be uploaded again), or with
 
 Especially welcome: anything that lets somebody outside the home network control the stove,
 lets the website (or someone who runs it) read, change or replay the end-to-end encrypted
-messages, takes over an account or a linked stove, or gets around the home network checks of
-the local dashboard (private addresses, host names, the WebSocket `Origin`, the API tokens).
+messages, takes over an account or a linked stove, gets around the home network checks of
+the local dashboard (private addresses, host names, the WebSocket `Origin`, the API tokens), or
+gets code onto the `deploy` branch (which automatic updates install as root) without a
+maintainer merging it, e.g. through the GitHub Actions workflow.
 
 By design and not a vulnerability: the local dashboard has no login on the home network, so
 anyone there can use the stove (README, "The local dashboard"). The Palazzetti Connection Box

@@ -175,9 +175,11 @@ tools/stove_local.py   answers stove.local on your PC for the hub in Docker (Win
 tools/auto-update.sh   follows the tested "deploy" branch: systemd timer for the VPS and the Pi (--auto-update)
 tools/make-shortcuts.py  Siri shortcuts (.shortcut files) with your token: "Control the stove", "Stove on", ...
 .github/workflows/     CI: the tests on every push; main -> deploy when they pass
+.github/dependabot.yml pull requests for new releases of the actions and of tests/requirements.txt
 docker/                the hub in a container, laid out as on the Pi; Dockerfile also builds the fake box
 compose.yaml           docker compose up -> hub on http://localhost:8080/ with the simulated stove
 tests/                 unit and end-to-end tests (python3 -m unittest discover -s tests)
+  requirements.txt       what CI installs for them: cryptography, pinned with hashes
 LICENSE                MIT licence
 SECURITY.md            how to report a security problem
 ```
@@ -264,7 +266,9 @@ python3 stove_web.py --host 192.168.1.50 --port 8080
 One page with on/off, setpoint ±0.5°, power, room fan, temperatures and pellets. Status reads are
 cached for 3 s, commands are answered with an optimistic status and the real one is re-read in the
 background, so the page reacts instantly although the serial link is slow. It has no login; use it
-on a trusted network only. The stove master grew out of it.
+on a trusted network only. Other web sites cannot use it through your browser: it answers only
+under the computer's IP addresses and names (not under another domain, no DNS rebinding) and takes
+commands only from its own page. The stove master grew out of it.
 
 ### `cbox_probe.py` – read-only probe of the box
 
@@ -799,7 +803,11 @@ GitHub: that updates the fork's `main`, runs the tests and moves its `deploy`. C
 the Pi and the VPS (for the ready-made SD card,
 set `REPO_URL` in `pi/make-image.py` to it). A checkout that already exists can be moved over
 with `git remote set-url origin <your fork>`. A private fork works too, with the credentials
-described above.
+described above. Whoever can push to the fork (your GitHub account, its tokens and SSH keys)
+decides what runs as root on the Pi and the VPS: protect the account with two-factor
+authentication, and under the fork's *Settings → Actions → General* allow only actions created
+by GitHub and tick *Require actions to be pinned to a full-length commit SHA* (the workflow pins
+every action to the commit of a release).
 
 An update that did not get all the way is taken up again without a new commit: one stopped
 part-way (a shutdown, `systemctl stop`) is installed again at the next check. A command can also
@@ -861,7 +869,9 @@ the two lines (again with backup and `nginx -t`), the snippet, the service and t
 * **The first administrator** is created by `deploy.sh` (or later with
   `sudo stove-cloud admin NAME EMAIL`), never through the web: nobody on the internet can claim
   it. The printed link (`…/#/setup/<token>`, 7 days, works once) opens a page to choose the
-  password.
+  password. An existing account is only made administrator when both the name and the e-mail are
+  its own and it is not waiting for approval; a name someone registered on the website is refused.
+  Disabling an account (**Users** or `stove-cloud user disable`) also voids its unused links.
 * **Registration**: anyone can ask for an account on the website (switch it off with
   `[accounts] allow_registration = no`). The account is pending; every administrator gets an
   e-mail with a link (`…/#/approve/<token>`, 7 days, works once) to **Approve** or **Reject** —
@@ -870,14 +880,15 @@ the two lines (again with backup and `nginx -t`), the snippet, the service and t
 * **Passwords never reach the server.** The browser derives two keys from the password (PBKDF2,
   600 000 iterations, then HKDF): the *auth key* is sent instead of the password (the server
   keeps a salted hash of it), the *vault key* stays in the browser and encrypts the account's
-  list of stoves. Changing the password re-encrypts the list in the browser.
+  list of stoves. Changing the password re-encrypts the list in the browser and signs out every
+  other device, including pages that are open there.
 * **Forgotten password**: "Forgot password?" e-mails a reset link (1 hour). Because the list of
   stoves was encrypted with the old password, it cannot be opened any more: the stoves are added
   again with their tokens. Without e-mail an administrator can print a link:
   `sudo stove-cloud reset-link NAME`.
 * **Sign-in throttling**: 5 failures per account from one IP, 20 from one IP, or 30 for an account
   from all IPs pause sign-ins for 15 minutes; registrations and reset mails are limited per IP and
-  per day.
+  per day. For these limits an IPv6 address counts as its whole /64 network.
 
 ### E-mail
 
@@ -938,7 +949,8 @@ password. Either way `sudo stove-cloud test-mail you@example.com` sends a test.
    from now on the stove is in your account on every device you sign in with.
 
 Each account gets its own link key; the Pi lists the accounts under **Online** (and
-`sudo stove-master links`) and can remove them. An account removes a stove under **Stoves**. A
+`sudo stove-master links`) and can remove them (the command line's removal reaches the running
+service within half a minute). An account removes a stove under **Stoves**. A
 new token (`Make a new token`, or `sudo stove-master token --new`) stops the old one from adding
 the stove; accounts that already added it keep working.
 
@@ -954,7 +966,7 @@ the stove; accounts that already added it keep working.
 | `mail` | `smtp_host`, `smtp_port`, `smtp_security`, `smtp_user`, `smtp_password`, `from_addr` | *(empty)*, `587`, `starttls` | SMTP; empty host = mails go to the log; `mail-server.sh` sets `127.0.0.1`, `25`, `none` |
 | `accounts` | `allow_registration` | `yes` | show "Create an account" |
 | | `session_days` | `60` | sign-ins expire after this many days without use |
-| `limits` | `max_devices` | `100` | most Pis that may register |
+| `limits` | `max_devices` | `100` | most Pis that may register; when full, Pis no account added that are offline make room (those not seen for 2 days, or else the one seen longest ago) and register again when they reconnect |
 | | `push_hosts` | *(empty)* | extra push services to allow |
 | `paths` | `db`, `app` | `/var/lib/stove-cloud/cloud.db`, `app/` | database, web app files |
 
@@ -1027,8 +1039,8 @@ be picked on the Account or Online page.
   and the website's status).
 
 <p align="center">
-  <img src="docs/screenshots/add-stove.webp" width="250" alt="Adding a stove with its token">&nbsp;
-  <img src="docs/screenshots/home-light.webp" width="250" alt="Stove screen in the light theme">&nbsp;
+  <img src="docs/screenshots/add-stove.webp" width="250" alt="Adding a stove with its token on the website">&nbsp;
+  <img src="docs/screenshots/home-light.webp" width="250" alt="Stove screen in the light theme: today's slots, temperatures and pellets">&nbsp;
   <img src="docs/screenshots/slot-editor.webp" width="250" alt="Slot editor sheet">
 </p>
 <p align="center">
@@ -1209,6 +1221,13 @@ python3 -m unittest discover -s tests
 
 GitHub Actions runs the same suite on every push and pull request (Ubuntu, Python 3.11, Node 22)
 and moves the `deploy` branch when it passes on `main` — see [Automatic updates](#automatic-updates).
+It installs only the versions in `tests/requirements.txt`, checked against their SHA-256 hashes
+(on Python 3.11+, `python3 -m pip install --require-hashes -r tests/requirements.txt` gives you
+the same), and every action it uses is pinned to a commit; Dependabot proposes updates of both as
+pull requests, which reach `deploy` only once they are merged. The workflow uses no secrets. A
+pull request from a fork runs the fork's own copy of the workflow, but GitHub gives it a
+read-only token and no secrets, so it cannot move `deploy`. Like the code, the workflow's runs
+and logs are public: they contain only the test output.
 
 Python 3.7+ on the Pi and on the VPS: the standard library, plus the `cryptography` package for
 the encryption and push notifications.

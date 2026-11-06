@@ -232,7 +232,7 @@ class CloudServer(ThreadingHTTPServer):
         """First password of an account created on the command line (the administrator)."""
         d = req.json()
         u = self.accounts.consume_token("setup", d.get("token"))
-        if not u:
+        if not u or u["status"] == "disabled":     # a link alone never undoes "Disable"
             raise HTTPError(404, "This link is invalid, has expired or was already used.")
         self.accounts.set_secret(u["id"], d.get("salt"), d.get("auth"), d.get("iterations"), vault=None)
         self.accounts.set_status(u["id"], "active")
@@ -277,7 +277,8 @@ class CloudServer(ThreadingHTTPServer):
         if vault is None:
             raise HTTPError(400, "the vault (re-encrypted with the new password) is missing")
         self.accounts.set_secret(user["id"], d.get("salt"), d.get("auth"), d.get("iterations"), vault=vault,
-                                 keep_session=req.cookie(COOKIE))
+                                 keep_session=req.session)
+        self.hub.drop_user(user["id"], keep_hash=token_hash(req.session))   # their open connections too
         u = self.accounts.get(user["id"])
         return {"ok": True, "message": "Password changed. Other devices were signed out.",
                 "vault": {"blob": u["vault"], "version": u["vault_version"]}}
@@ -394,11 +395,23 @@ class CloudServer(ThreadingHTTPServer):
 
 
 def create_setup_link(cfg, accounts, username, email):
-    """Command line: create (or re-invite) an administrator who sets the password in the browser."""
-    u = accounts.find(username) or accounts.find(email)
+    """Command line: create (or re-invite) an administrator who sets the password in the browser.
+    An existing account is re-invited only when both the name and the e-mail are its own: anyone
+    can register a name on the website, with an address of their own."""
+    by_name, by_mail = accounts.find(username), accounts.find(email)
+    u = by_name or by_mail
     if u is None:
         uid = accounts.create(username, email, role="admin", status="pending")
     else:
+        name = u["username"]
+        if by_name is None or by_mail is None or by_name["id"] != by_mail["id"]:
+            raise AuthError(f"{name} <{u['email']}> already exists - use another name and e-mail, "
+                            f"or delete that account first (stove-cloud user delete {name})")
+        if u["status"] == "disabled":
+            raise AuthError(f"{name} is disabled - enable it first (stove-cloud user enable {name})")
+        if u["status"] == "pending" and u["auth_hash"]:
+            raise AuthError(f"{name} asked for an account on the website and waits for approval - "
+                            f"approve or delete it first (stove-cloud user approve|delete {name})")
         uid = u["id"]
         accounts.set_role(uid, "admin")
     return cfg.public_url + "#/setup/" + accounts.create_token("setup", uid, SETUP_TTL)
@@ -583,6 +596,8 @@ class Handler(BaseHTTPRequestHandler):
         sock = ws.server_upgrade(self, max_message=1024 * 1024, ping_interval=25, idle_timeout=80)
         if sock:
             hub.serve_device(device_id, sock, ip)
+        else:
+            hub.device_failed(device_id)
 
     def _client_socket(self, query):
         srv = self.server

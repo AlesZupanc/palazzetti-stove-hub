@@ -4,6 +4,7 @@ end-to-end encrypted control, unlinking, and push notifications."""
 
 import base64
 import configparser
+import contextlib
 import hashlib
 import http.client
 import io
@@ -16,6 +17,7 @@ import threading
 import time
 import types
 import unittest
+from unittest import mock
 
 from helpers import ROOT, FakeStove, make_config, temp_db
 
@@ -37,9 +39,11 @@ from stovecloud.push import Pusher  # noqa: E402
 from stovecloud.updates import Updates  # noqa: E402
 from stovecloud.web import CloudServer, create_setup_link  # noqa: E402
 
+import stove_master  # noqa: E402
 from stovemaster import e2e, ws  # noqa: E402
 from stovemaster.api import Hub  # noqa: E402
 from stovemaster.cloud import CloudLink  # noqa: E402
+from stovemaster.db import DB as PiDB  # noqa: E402
 from stovemaster.scheduler import Scheduler  # noqa: E402
 
 ITER = 100000
@@ -286,6 +290,42 @@ class Website(unittest.TestCase):
         self.assertEqual((status, body["available"]), (200, True))
         self.assertTrue(os.path.exists(os.path.join(tmp, "update-request")))
 
+    def test_1b_admin_links_cannot_be_claimed_or_outlive_disable(self):
+        def setup(token, password):
+            salt = base64.b64encode(os.urandom(16)).decode()
+            return Browser(self.port).api("POST", "setup", {"token": token, "salt": salt,
+                                                            "auth": derive(password, salt)[0], "iterations": ITER})[0]
+
+        # someone registers the name of an administrator-to-be with an address of their own
+        self.make_user("bert", approve=False)
+        self.accounts.db.run("UPDATE users SET email = 'evil@attacker.example' WHERE username = 'bert'")
+        for name, email in (("bert", "bert@corp.example"), ("bertie", "evil@attacker.example"),
+                            ("bert", "evil@attacker.example")):          # (the last: waits for approval)
+            with self.assertRaises(accmod.AuthError):
+                create_setup_link(self.cfg, self.accounts, name, email)
+        self.assertEqual((self.accounts.find("bert")["role"], self.accounts.find("bertie")), ("user", None))
+        # an administrator invited on the command line, then disabled before using the link: the link
+        # is void, on the command line (stove-cloud user disable) and on the Users page alike
+        salt = base64.b64encode(os.urandom(16)).decode()
+        self.accounts.create("ada", "ada@example.com", salt, derive("ada pass 1", salt)[0], ITER, role="admin",
+                             status="active")
+        admin = Browser(self.port)
+        self.assertEqual(self.sign_in(admin, "ada", "ada pass 1")[0], 200)
+        for name in ("carl", "dora"):
+            links = [create_setup_link(self.cfg, self.accounts, name, f"{name}@example.com"),
+                     create_setup_link(self.cfg, self.accounts, name.upper(), f"{name}@EXAMPLE.com")]   # re-invite
+            uid = self.accounts.find(name)["id"]
+            if name == "carl":
+                self.accounts.set_status(uid, "disabled")
+            else:
+                self.assertEqual(admin.api("POST", f"users/{uid}", {"action": "disable"})[0], 200)
+            for link in links:
+                self.assertEqual(setup(link.split("#/setup/")[1], "new pass 1"), 404)
+            self.assertEqual(self.accounts.find(name)["status"], "disabled")
+            self.assertEqual(self.sign_in(Browser(self.port), name, "new pass 1")[0], 401)
+            with self.assertRaises(accmod.AuthError):                 # enable it first
+                create_setup_link(self.cfg, self.accounts, name, f"{name}@example.com")
+
     def test_2_server_never_sees_the_password(self):
         b, pw, _ = self.make_user("noel", "noel's secret")
         row = self.accounts.find("noel")
@@ -309,6 +349,11 @@ class Website(unittest.TestCase):
         # change the password: the vault is re-encrypted by the browser, other sign-ins end
         other = Browser(self.port)
         self.sign_in(other, "vera", pw)
+        # ... also their open stove pages (e.g. on a lost phone), not those of the browser that changed it
+        mine, theirs = b.connect(self.link.device_id), other.connect(self.link.device_id)
+        for sock in (mine, theirs):
+            sock.send(json.dumps({"t": "open"}))
+            self.assertEqual(Browser.recv(sock)["t"], "error")         # served by the website now
         salt = base64.b64encode(os.urandom(16)).decode()
         new_auth, new_key = derive("new password 2", salt)
         old_auth = derive(pw, self.accounts.find("vera")["salt"])[0]
@@ -317,6 +362,13 @@ class Website(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertEqual(other.api("GET", "devices")[0], 401)
         self.assertEqual(b.api("GET", "devices")[0], 200)
+        reader = threading.Thread(target=theirs.recv, daemon=True)     # (fails, not hangs, if left open)
+        reader.start()
+        reader.join(10)
+        self.assertEqual(theirs.close_code, 4401)
+        mine.send(json.dumps({"t": "open"}))
+        self.assertEqual(Browser.recv(mine)["t"], "error")
+        mine.close()
         status, body, key2 = self.sign_in(Browser(self.port), "vera", "new password 2")
         self.assertEqual(open_vault(key2, body["vault"]["blob"]), {"v": 1, "devices": [1]})
 
@@ -428,6 +480,40 @@ class Website(unittest.TestCase):
         self.assertIs(self.link.ws, uplink)       # the hub stayed connected all along
         self.assertTrue(self.link.connected)
 
+    def test_6e_the_command_line_reaches_the_running_service(self):
+        b, sock, session, device_id = self.pair_session("remy")
+        result = b.rpc(sock, session, "pair.finish", rid=2)["r"]
+        sock.close()
+        uid = self.accounts.find("remy")["id"]
+        self.assertTrue(self.wait(lambda: self.hub.is_linked(device_id, uid)))
+        key = base64.b64decode(result["key"])
+        sock, session, _ = b.session(device_id, "link", key, link=result["link"])
+        self.assertIsNotNone(session)
+        cfg = make_config(cloud_url=self.link.url, paths_db=self.pi_db.path)
+
+        def cli(command, **args):      # "sudo stove-master ...": a process of its own that only changes the database
+            opened = []
+            with mock.patch.object(stove_master, "DB", lambda path: opened.append(PiDB(path)) or opened[-1]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                command(cfg, types.SimpleNamespace(**args))
+            for db in opened:
+                db.close()
+
+        cli(stove_master.links_cmd, action="remove", id=result["link"])
+        # the service refuses the next session at once, ends the open one and tells the website
+        sock2, session2, reply = b.session(device_id, "link", key, link=result["link"])
+        self.assertEqual((session2, reply["t"], reply["code"]), (None, "closed", 404))
+        self.assertEqual(self.next_closed(b, sock)["code"], 404)
+        self.assertTrue(self.wait(lambda: not self.hub.is_linked(device_id, uid)))
+        sock.close()
+        sock2.close()
+        # "token --new" there: pairing sessions opened with the old token end at the next look
+        b3, sock3, _, _ = self.pair_session("remo")
+        cli(stove_master.token_cmd, new=True)
+        self.link.sync_links()                    # what the service does every SYNC_INTERVAL
+        self.assertEqual(self.next_closed(b3, sock3)["reason"], "the token was replaced")
+        sock3.close()
+
     def test_7_push_notification_end_to_end(self):
         b, pw, _ = self.make_user("pia")
         self.sign_in(b, "pia", pw)
@@ -496,6 +582,14 @@ class Website(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 401)
         with self.assertRaises(ws.HandshakeError):
             ws.connect(f"ws://127.0.0.1:{self.port}/mystove/ws/device")
+        # a request that is no WebSocket registers nothing
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/mystove/ws/device", headers={"Authorization": f"Device JUNKDEV2.{'j' * 30}"})
+        r = conn.getresponse()
+        r.read()
+        conn.close()
+        self.assertEqual(r.status, 400)
+        self.assertIsNone(self.db.one("SELECT id FROM devices WHERE id = 'JUNKDEV2'"))
 
     def test_9_app_files_and_headers(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
@@ -551,6 +645,101 @@ class Unit(unittest.TestCase):
             acc.authenticate("ana", auth, "203.0.113.1")
         self.assertEqual(ctx.exception.status, 429)
         self.assertEqual(acc.authenticate("ana", auth, "198.51.100.2")["id"], uid)
+        # an IPv6 /64 counts as one address: a new address for every try gains nothing
+        for n in range(accmod.LOGIN_PAIR_LIMIT[0]):
+            with self.assertRaises(accmod.AuthError):
+                acc.authenticate("ana", wrong, f"2001:db8:5:5::{n + 1}")
+        with self.assertRaises(accmod.AuthError) as ctx:
+            acc.authenticate("ana", auth, "2001:db8:5:5:ffff::1")
+        self.assertEqual(ctx.exception.status, 429)
+        self.assertEqual(acc.authenticate("ana", auth, "2001:db8:5:6::1")["id"], uid)
+
+    def test_client_key(self):
+        self.assertEqual(accmod.client_key("203.0.113.7"), "203.0.113.7")
+        self.assertEqual(accmod.client_key("::ffff:203.0.113.7"), "203.0.113.7")
+        self.assertEqual(accmod.client_key("2001:db8:1:2:aaaa::1"), "2001:db8:1:2::/64")
+        self.assertEqual(accmod.client_key("2001:db8:1:2::5"), "2001:db8:1:2::/64")
+        self.assertEqual((accmod.client_key(None), accmod.client_key("junk")), ("?", "junk"))
+
+    def test_made_up_hubs_cannot_keep_real_ones_out(self):
+        db = CloudDB(os.path.join(tempfile.mkdtemp(), "c.db"))
+        self.addCleanup(db.close)
+        acc = Accounts(db)
+        hub = CloudHub(db, acc, None, types.SimpleNamespace(max_devices=3))
+        count = lambda: db.one("SELECT COUNT(*) AS n FROM devices")["n"]  # noqa: E731
+        known = lambda: {r["id"] for r in db.all("SELECT id FROM devices")}  # noqa: E731
+
+        def register(device_id, ip="203.0.113.1"):
+            return hub.device_auth(f"Device {device_id}.{'s' * 30}", ip)
+
+        # a request that was no WebSocket keeps no row
+        register("AAAAAAAA")
+        hub.device_failed("AAAAAAAA")
+        self.assertEqual(count(), 0)
+        # full: one hub was added to an account, one is online, one connected once and went away ...
+        now = time.time()
+        for i, device_id in enumerate(("AAAAAAAA", "BBBBBBBB", "CCCCCCCC")):
+            register(device_id)
+            db.run("UPDATE devices SET last_seen = ? WHERE id = ?", (now - 3600 + i, device_id))
+        uid = acc.create("ana", "ana@example.com")
+        db.run("INSERT INTO links(device_id, user_id, created_at) VALUES('AAAAAAAA', ?, ?)", (uid, now))
+        hub.devices["BBBBBBBB"] = object()
+        # ... so a new hub takes the place of the one that went away, and then of the newest one
+        for device_id in ("DDDDDDDD", "EEEEEEEE"):
+            self.assertEqual(register(device_id, "203.0.113.2"), device_id)
+            self.assertEqual(count(), 3)
+        self.assertEqual(known(), {"AAAAAAAA", "BBBBBBBB", "EEEEEEEE"})
+        hub.devices["EEEEEEEE"] = object()               # all added or online: no room
+        with self.assertRaises(PermissionError) as ctx:
+            register("FFFFFFFF", "203.0.113.3")
+        self.assertEqual(ctx.exception.args[0], 503)
+        # hubs nobody added are forgotten after two days offline, all at once
+        del hub.devices["EEEEEEEE"], hub.devices["BBBBBBBB"]
+        db.run("UPDATE devices SET last_seen = ? WHERE id != 'AAAAAAAA'", (now - 3 * 86400,))
+        register("GGGGGGGG", "203.0.113.3")
+        self.assertEqual(known(), {"AAAAAAAA", "GGGGGGGG"})
+        # new ids are limited per IPv6 /64, not per address
+        hub = CloudHub(db, acc, None, types.SimpleNamespace(max_devices=100))
+        for n in range(10):
+            register("SIX" + "ABCDEFGHIJ"[n] + "AAAA", f"2001:db8:1:2::{n + 1}")
+        with self.assertRaises(PermissionError) as ctx:
+            register("SIXKAAAA", "2001:db8:1:2:ffff::1")
+        self.assertEqual(ctx.exception.args[0], 429)
+        register("SIXKAAAA", "2001:db8:1:3::1")
+
+    def test_a_browser_signed_out_elsewhere_ends_at_its_next_message(self):
+        from stovecloud import hub as hubmod
+        db = CloudDB(os.path.join(tempfile.mkdtemp(), "c.db"))
+        self.addCleanup(db.close)
+        acc = Accounts(db)
+        hub = CloudHub(db, acc, None, None)
+        relayed, closed = [], []
+        hub.devices["ABCDEFGH"] = types.SimpleNamespace(sender=types.SimpleNamespace(pending=0), send=relayed.append)
+        token = acc.create_session(acc.create("ana", "ana@example.com"))
+        client = types.SimpleNamespace(sid="s1", device_id="ABCDEFGH", session_hash=accmod.token_hash(token),
+                                       sock=types.SimpleNamespace(close=lambda code, reason: closed.append(code)),
+                                       checked=time.monotonic() - hubmod.SESSION_CHECK - 1)
+        hub._from_client(client, {"t": "data", "c": "a"})          # checked again: still signed in
+        acc.revoke_session(token)                                   # e.g. "stove-cloud user disable"
+        hub._from_client(client, {"t": "data", "c": "b"})          # checked a moment ago: relayed
+        client.checked -= hubmod.SESSION_CHECK + 1
+        hub._from_client(client, {"t": "data", "c": "c"})
+        self.assertEqual(([m["c"] for m in relayed], closed), (["a", "b"], [4401]))
+
+    def test_create_setup_link_only_for_the_accounts_own_name_and_email(self):
+        db = CloudDB(os.path.join(tempfile.mkdtemp(), "c.db"))
+        self.addCleanup(db.close)
+        acc = Accounts(db)
+        cfg = types.SimpleNamespace(public_url="https://example.com/mystove/")
+        create_setup_link(cfg, acc, "boss", "boss@example.com")
+        create_setup_link(cfg, acc, "Boss", "BOSS@example.com")    # a new link for the same account
+        self.assertEqual(len(db.all("SELECT * FROM tokens WHERE kind = 'setup'")), 2)
+        acc.create("bob", "evil@attacker.example", status="active")   # registered by someone else
+        for name, email in (("bob", "bob@corp.example"), ("bobby", "evil@attacker.example"),
+                            ("boss", "evil@attacker.example")):
+            with self.assertRaises(accmod.AuthError):
+                create_setup_link(cfg, acc, name, email)
+        self.assertEqual((acc.find("bob")["role"], acc.find("bobby")), ("user", None))
 
     def test_push_endpoint_allowlist(self):
         db = CloudDB(os.path.join(tempfile.mkdtemp(), "c.db"))
@@ -579,7 +768,7 @@ class Unit(unittest.TestCase):
         dev.sender = Peer()
         dev.sender.pending = hubmod.DEVICE_BACKLOG + 1
         dev.sessions = {"s1": client}
-        client.sid, client.device_id = "s1", "ABCDEFGH"
+        client.sid, client.device_id, client.checked = "s1", "ABCDEFGH", time.monotonic()
         hub.devices["ABCDEFGH"] = dev
         hub._from_client(client, {"t": "data", "c": "abc"})
         self.assertEqual(client.sent, [{"t": "closed", "reason": "the stove is busy - try again in a moment"}])

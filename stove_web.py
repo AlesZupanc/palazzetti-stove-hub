@@ -11,19 +11,25 @@ Run:
 
 Then open http://<this-computer-ip>:8080 on any phone/PC on your network.
 (On the same device: http://localhost:8080)
+No login: anyone on the network can use it. Other web sites cannot, through a
+visitor's browser: only this computer's addresses and names are answered (no
+DNS rebinding), and commands only from the page itself.
 """
 
 import argparse
+import ipaddress
 import json
 import socket
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import palazzetti as plz
 
 STATUS_TTL = 3.0  # seconds a status read is reused, keeps load off the stove's serial link
+LIMITS = {"setpoint": (5.0, 40.0), "power": (1, 5), "fan": (0, 7)}   # as stovemaster/stove.py
 
 
 class Stove:
@@ -96,6 +102,48 @@ class Stove:
                 self._refresh()
             except plz.PalazzettiError as e:
                 print(f"  background refresh failed: {e}", file=sys.stderr)
+
+
+def check_action(name, value):
+    """(action, cleaned value); ValueError for anything the stove should not get."""
+    if name in ("on", "off"):
+        return name, None
+    if name not in LIMITS:
+        raise ValueError(f"unknown action {name!r}")
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number")
+    lo, hi = LIMITS[name]
+    v = float(value) if name == "setpoint" else int(value)
+    if not lo <= v <= hi:
+        raise ValueError(f"{name} must be between {lo:g} and {hi:g}")
+    return name, v
+
+
+def split_host(host_header):
+    """'192.168.1.5:8080' -> '192.168.1.5'; '[fe80::1]:8080' -> 'fe80::1' (as stovemaster/lan.py)."""
+    host = (host_header or "").strip().lower()
+    if host.startswith("["):
+        return host[1:host.find("]")] if "]" in host else ""
+    if host.count(":") == 1:
+        host = host.split(":")[0]
+    return host.rstrip(".")
+
+
+def request_ok(headers, method):
+    """Only for this page, not for other web sites through the visitor's browser: the Host must be
+    an address or a name of this computer (DNS rebinding), an Origin must be the page's own, and a
+    command must be JSON, which another site cannot send without a CORS preflight (never allowed)."""
+    host = split_host(headers.get("Host"))
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        me = socket.gethostname().lower()
+        if host not in ("localhost", me, me + ".local"):
+            return False
+    origin = headers.get("Origin")
+    if origin is not None and urllib.parse.urlsplit(origin).netloc.lower() != headers.get("Host", "").strip().lower():
+        return False
+    return method != "POST" or headers.get("Content-Type", "").split(";")[0].strip().lower() == "application/json"
 
 
 def summarize(d: dict) -> dict:
@@ -260,7 +308,15 @@ def make_handler(stove: Stove):
             self.end_headers()
             self.wfile.write(body)
 
+        def _refused(self):
+            if request_ok(self.headers, self.command):
+                return False
+            self._json(403, {"error": "Only for this page: open it by this computer's IP address."})
+            return True
+
         def do_GET(self):
+            if self._refused():
+                return
             if self.path in ("/", "/index.html"):
                 body = PAGE.encode()
                 self.send_response(200)
@@ -277,13 +333,18 @@ def make_handler(stove: Stove):
                 self._json(404, {"error": "not found"})
 
         def do_POST(self):
+            if self._refused():
+                return
             if self.path != "/api/action":
                 return self._json(404, {"error": "not found"})
             try:
                 n = int(self.headers.get("Content-Length", 0))
                 req = json.loads(self.rfile.read(n) or b"{}")
+                if not isinstance(req, dict):
+                    raise ValueError("expected a JSON object")
+                name, value = check_action(req.get("action"), req.get("value"))
                 t = time.monotonic()
-                state = stove.action(req.get("action"), req.get("value"))
+                state = stove.action(name, value)
                 out = summarize(state)
                 out["took"] = round(time.monotonic() - t, 1)
                 self._json(200, out)

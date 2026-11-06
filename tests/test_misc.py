@@ -239,5 +239,63 @@ class StoveWrapper(unittest.TestCase):
         self.assertEqual(phase_of(51), "running")
 
 
+class StoveWebPage(unittest.TestCase):
+    """stove_web.py: no login, but no other web site may use it through a visitor's browser."""
+
+    class FakeStove:
+        def __init__(self):
+            self.done = []
+
+        def status(self):
+            return {"STATUS": 0, "SETP": 20.0}
+
+        def action(self, name, value=None):
+            self.done.append((name, value))
+            return self.status()
+
+    def setUp(self):
+        import stove_web
+        from http.server import ThreadingHTTPServer
+        self.stove = self.FakeStove()
+        handler = stove_web.make_handler(self.stove)
+        handler.log_message = lambda *a: None
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.host = f"127.0.0.1:{self.server.server_address[1]}"
+
+    def call(self, method, path, body=None, **headers):
+        import http.client
+        conn = http.client.HTTPConnection(self.host, timeout=5)
+        headers = {k.replace("_", "-"): v for k, v in headers.items()}
+        conn.request(method, path, body=body, headers=headers)
+        r = conn.getresponse()
+        r.read()
+        conn.close()
+        return r.status
+
+    def test_only_its_own_page(self):
+        own = {"Content_Type": "application/json", "Origin": f"http://{self.host}"}
+        self.assertEqual(self.call("GET", "/"), 200)
+        self.assertEqual(self.call("GET", "/api/status"), 200)
+        self.assertEqual(self.call("POST", "/api/action", '{"action": "on"}', **own), 200)
+        self.assertEqual(self.call("POST", "/api/action", '{"action": "off"}', Content_Type="application/json"), 200)
+        # a page elsewhere: no preflight-free request, no foreign Origin, no rebound host name
+        attacks = (dict(Content_Type="text/plain;charset=UTF-8"),
+                   dict(Content_Type="application/x-www-form-urlencoded"),
+                   dict(own, Origin="https://evil.example"), dict(own, Origin="null"),
+                   dict(own, Host="rebind.evil.example", Origin="http://rebind.evil.example"))
+        for headers in attacks:
+            self.assertEqual(self.call("POST", "/api/action", '{"action": "on"}', **headers), 403, headers)
+        self.assertEqual(self.call("GET", "/api/status", Host=f"rebind.evil.example:{self.host.split(':')[1]}"), 403)
+        # and only values the stove takes
+        for bad in ('{"action": "setpoint", "value": 99}', '{"action": "power", "value": 0}',
+                    '{"action": "fan", "value": true}', '{"action": "explode"}', '[1]'):
+            self.assertEqual(self.call("POST", "/api/action", bad, **own), 400, bad)
+        self.assertEqual(self.call("POST", "/api/action", '{"action": "setpoint", "value": 21.5}', **own), 200)
+        self.assertEqual(self.stove.done, [("on", None), ("off", None), ("setpoint", 21.5)])
+
+
 if __name__ == "__main__":
     unittest.main()

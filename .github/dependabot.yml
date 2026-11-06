@@ -1,0 +1,27 @@
+# Dependabot opens a pull request when an action in .github/workflows or a package in
+# tests/requirements.txt has a new release; it updates the pinned commit or the hashes. The pull
+# request runs the tests like any other, and nothing reaches "deploy" before you merge it - but a
+# merge reaches every auto-updating Pi and VPS a minute later, so read it first, never auto-merge.
+# "cooldown": a release is only proposed once it is a week old, so a bad release that is pulled
+# within days never shows up here.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: /tests
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      test-requirements:          # cryptography, cffi and pycparser move together
+        patterns: ["*"]

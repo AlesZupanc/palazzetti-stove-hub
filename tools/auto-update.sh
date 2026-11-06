@@ -91,8 +91,9 @@ update() {
     local repo=$1 branch=$2; shift 2
     # asked for on the web page: take the request away first, or systemd starts the next run at once
     if [ -n "$REQUEST" ] && [ -e "$REQUEST" ]; then rm -f "$REQUEST"; MANUAL=1; echo "auto-update: asked for on the web page"; fi
-    local lock="/tmp/stove-auto-update-$(printf '%s' "$repo" | tr -c 'A-Za-z0-9' _).lock"
-    exec 9>"$lock"
+    # lock the checkout's .git folder itself: unlike a fixed name in /tmp, nobody can create it first,
+    # and only an account that can read the checkout can hold it
+    exec 9<"$repo/.git"
     if ! flock -n 9; then echo "auto-update: another run is still going on"; return 0; fi
     cd "$repo"
     STATUS_ON=1

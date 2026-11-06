@@ -250,7 +250,8 @@ def token_cmd(cfg, args):
         print("A new token was made. The old one no longer works; accounts added before keep working.\n")
     print(f"Token:  {cloud.token}")
     print(f"Or open this link and sign in:  {cloud.info(lan=True)['add_url']}")
-    print("(The running service picks up a new token at once.)" if args.new else "")
+    print("(The running service picks up a new token at once and ends pairing sessions opened with the old one"
+          " within half a minute.)" if args.new else "")
 
 
 def api_token_cmd(cfg, args):
@@ -280,8 +281,8 @@ def links_cmd(cfg, args):
         link = cloud.links[args.id]
         cloud.unlink(args.id, reason="removed on the command line")
         db.log_event("cli", "cli", "account removed", f"{link['profile']} can no longer reach the stove")
-        print(f"{link['profile']} can no longer reach the stove (takes effect when the service reconnects,"
-              f" or at once after: sudo systemctl restart stove-master)")
+        print(f"{link['profile']} can no longer reach the stove (the running service ends its open sessions"
+              f" and tells the website within half a minute)")
         return
     if not cloud.links:
         print("No account has added this stove yet. Token: " + cloud.token)

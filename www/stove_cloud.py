@@ -216,16 +216,17 @@ def admin_cmd(cfg, args):
         link = create_setup_link(cfg, accounts, args.username, args.email)
     except AuthError as e:
         sys.exit(e.message)
-    print(f"Administrator {args.username} <{args.email}>.")
+    u = accounts.find(args.username)       # as stored, which is what the link sets up
+    print(f"Administrator {u['username']} <{u['email']}>.")
     print("Open this link to choose the password (valid for 7 days, works once):\n")
     print(f"  {link}\n")
     mailer = Mailer(cfg)
     if mailer.configured and not args.no_mail:
         try:
-            mailer.send_now(args.email, "Stove website: set your password",
-                                f"Hello {args.username},\n\nyou are the administrator of the stove website.\n"
+            mailer.send_now(u["email"], "Stove website: set your password",
+                                f"Hello {u['username']},\n\nyou are the administrator of the stove website.\n"
                                 f"Choose your password here (valid for 7 days):\n\n{link}\n")
-            print(f"(also sent to {args.email})")
+            print(f"(also sent to {u['email']})")
         except Exception as e:  # the link above still works
             print(f"(could not e-mail it: {e})")
 

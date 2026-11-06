@@ -79,6 +79,26 @@ class AutoUpdate(unittest.TestCase):
         code, out = self.run_update()
         self.assertEqual((code, self.runs(), self.version_on_server()), (0, ["2"], "2"))
 
+    def test_one_run_at_a_time_and_no_lock_in_tmp(self):
+        import fcntl
+        self.commit("2", push=["main:deploy"])
+        fd = os.open(os.path.join(self.server, ".git"), os.O_RDONLY)     # a run is going on
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            code, out = self.run_update()
+            self.assertEqual((code, self.runs()), (0, []))
+            self.assertIn("another run is still going on", out)
+        finally:
+            os.close(fd)
+        # what the script used to lock: any local user could make or hold that file and stop updates
+        old = "/tmp/stove-auto-update-" + "".join(c if c.isalnum() and c.isascii() else "_"
+                                                  for c in os.path.realpath(self.server)) + ".lock"
+        with open(old, "w") as f:
+            self.addCleanup(os.remove, old)
+            fcntl.flock(f, fcntl.LOCK_EX)
+            code, out = self.run_update()
+        self.assertEqual((code, self.runs(), self.version_on_server()), (0, ["2"], "2"), out)
+
     def test_failed_install_goes_back_and_waits_for_a_fix(self):
         self.commit("2", bad=True, push=["main:deploy"])
         code, out = self.run_update()
